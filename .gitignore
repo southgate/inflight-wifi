@@ -1,0 +1,26 @@
+# Session output — contains flight numbers, position, MACs, IPs
+inflightd_*.json
+probe_*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code local state — keep settings.json/agents/ committed if you want
+# to share them with collaborators; ignore only the per-user bits.
+.claude/settings.local.json
