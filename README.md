@@ -1,6 +1,6 @@
 # inflightd
 
-A terminal-based diagnostic tool for inflight WiFi. Auto-detects the onboard system, surfaces hidden flight telemetry, measures the satellite link, plots your position on an ASCII world map, and tells you whether the connection is actually broken or just blocking ICMP.
+A terminal-based diagnostic tool for inflight WiFi. Auto-detects the onboard system, surfaces hidden flight telemetry, measures the satellite link, and tells you whether the connection is actually broken or just blocking ICMP.
 
 ## Why
 
