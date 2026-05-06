@@ -20,7 +20,7 @@ Inflight WiFi is frequently flaky in ways that are hard to diagnose. Is the sate
 
 | System                | Airlines                              | Status                              |
 | ---                   | ---                                   | ---                                 |
-| Panasonic Avionics    | TAP, SWISS (777s), KLM, Air France    | Verified on TAP and SWISS; full API mapped |
+| Panasonic Avionics    | TAP, SWISS, KLM, Air France           | Verified on TAP and SWISS; full API mapped |
 | Lufthansa FlyNet      | LH, OS, EW, WK                        | Detection + parser stubs, **not yet verified** on a live aircraft |
 
 Everything else lands as `Unknown` — `--probe-deep` is built to help map new systems quickly.
