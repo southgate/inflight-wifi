@@ -2,26 +2,6 @@
 
 A terminal-based diagnostic tool for inflight WiFi. Auto-detects the onboard system, surfaces hidden flight telemetry, measures the satellite link, plots your position on an ASCII world map, and tells you whether the connection is actually broken or just blocking ICMP.
 
-```
-+------------------------------------------------------------------------+
-|                                  .........................             |
-|                                        .        .....                 .|
-|                                         ........      ......         ..|
-|.........            ..            ..                     .     .    . .|
-|  ..     ...................  .....--..---                     ....   ..|
-|    .               -----.....-       .  -----------          ........ .|
-|     ...      ------        .       .....           ------      ....  ..|
-|       .   ----                  ...                     ---- ..........|
-|       .o--                    ..                       *    -o    .   .|
-|        ..                    .                               ......   .|
-|          ..            ... ..                                ....     .|
-|            .          .   ..                               ..         .|
-|             ......    ...                                ..           .|
-|                  .......                                 .            .|
-+------------------------------------------------------------------------+
-   o SFO     * TAP236    o LIS     - path  . land
-```
-
 ## Why
 
 Inflight WiFi is frequently flaky in ways that are hard to diagnose. Is the satellite handing off? Is the local AP overloaded? Is the gateway blocking ICMP and making the path look broken when TCP works fine? Is my device on a paid tier or stuck in the free messaging walled garden? The carriers don't surface any of this. The avionics vendors do — they just don't tell you the URL.
