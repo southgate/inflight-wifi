@@ -37,19 +37,9 @@ from typing import Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-PAC_OUI_PREFIXES = ["00:0d:2e"]  # Matsushita / Panasonic Avionics
-PAC_API_BASE = "https://api.airpana.com/inflight/services"
-
-# Lufthansa Group FlyNet (SWISS, Lufthansa, Austrian, Eurowings)
-FLYNET_SSIDS = ["telekom_flynet", "flynet", "lufthansa flynet", "swiss connect", "swissconnect"]
-FLYNET_PORTAL_DOMAINS = ["lufthansa-flynet.com", "flynet.lufthansa.com",
-                         "wlan.onboard.lufthansa.com",
-                         "swissconnect.com", "www.swissconnect.com",
-                         "portal.swissconnect.com", "api.swissconnect.com"]
-FLYNET_AIRLINES = {
-    "LX": "SWISS", "LH": "Lufthansa", "OS": "Austrian Airlines",
-    "EW": "Eurowings", "WK": "Edelweiss Air",
-}
+# Provider-specific constants (OUIs, SSIDs, portal domains, etc.) live as
+# class attributes on each Provider subclass below. To add a new provider,
+# subclass Provider and append to PROVIDERS — no changes here.
 
 LATENCY_GOOD = 100    # ms
 LATENCY_WARN = 500    # ms
@@ -396,7 +386,14 @@ class Snapshot:
 
 
 # ---------------------------------------------------------------------------
-# System detection
+# Provider framework
+#
+# Each inflight WiFi system (Panasonic, FlyNet, …) is a Provider subclass.
+# Adding a new system is two steps:
+#   1) Subclass Provider, implement detect() + discover_api_base() + fetch_*().
+#   2) Append an instance to PROVIDERS below.
+# Detection runs each provider against a one-shot NetworkSignals snapshot;
+# the highest-confidence Match wins.
 # ---------------------------------------------------------------------------
 
 def _detect_captive_portal() -> tuple[str, str, str]:
@@ -428,329 +425,448 @@ def _detect_captive_portal() -> tuple[str, str, str]:
     return portal_url, proxy_info, final_url
 
 
-def detect_system() -> SystemInfo:
-    info = SystemInfo()
-    wifi = get_wifi_info()
-    info.local_ip = wifi.get("ip_address", "")
-    info.subnet = wifi.get("subnet_mask", "")
-    info.gateway_ip = wifi.get("router", "")
-    info.dns_domain = get_dns_domain() or ""
-    info.gateway_mac = get_gateway_mac() or ""
-    info.ssid = wifi.get("ssid", "")
+@dataclass
+class NetworkSignals:
+    """Network observations gathered once before provider detection.
+    Providers read these — they don't re-issue network calls during detect()."""
+    ssid: str = ""
+    gateway_ip: str = ""
+    gateway_mac: str = ""
+    gateway_mac_oui: str = ""
+    dns_domain: str = ""
+    arp_clients: list = field(default_factory=list)
+    portal_url: str = ""
+    proxy: str = ""
+    local_ip: str = ""
+    subnet: str = ""
 
-    mac_prefix = info.gateway_mac[:8].lower() if info.gateway_mac else ""
-    ssid_lower = info.ssid.lower().strip()
-    clients = get_arp_clients()
+    @classmethod
+    def gather(cls) -> "NetworkSignals":
+        wifi = get_wifi_info()
+        sig = cls(
+            ssid=wifi.get("ssid", ""),
+            gateway_ip=wifi.get("router", ""),
+            local_ip=wifi.get("ip_address", ""),
+            subnet=wifi.get("subnet_mask", ""),
+            dns_domain=get_dns_domain() or "",
+            gateway_mac=get_gateway_mac() or "",
+            arp_clients=get_arp_clients(),
+        )
+        sig.gateway_mac_oui = sig.gateway_mac[:8].lower() if sig.gateway_mac else ""
+        sig.portal_url, sig.proxy, _ = _detect_captive_portal()
+        return sig
 
-    # --- Detect Lufthansa Group FlyNet (SWISS, Lufthansa, Austrian, etc.) ---
-    is_flynet = ssid_lower in FLYNET_SSIDS
-    flynet_dns = any(d in info.dns_domain.lower() for d in ["flynet", "telekom", "lufthansa"])
 
-    if not is_flynet and not flynet_dns:
-        # Check if captive portal redirects to a FlyNet domain
-        portal_url, proxy_info, _ = _detect_captive_portal()
-        for domain in FLYNET_PORTAL_DOMAINS:
-            if domain in (portal_url or ""):
-                is_flynet = True
-                info.portal_url = portal_url
-                break
-        if proxy_info:
-            info.proxy = proxy_info
+@dataclass
+class Match:
+    """A provider's claim that this network is theirs."""
+    confidence: int = 0
+    airline: str = ""
+    portal_url: str = ""
+    proxy: str = ""
+    hardware: str = ""
 
-    if is_flynet or flynet_dns:
-        info.provider = "Lufthansa Group FlyNet"
-        info.hardware = "Deutsche Telekom / EAN or Inmarsat Ka"
 
-        if not info.portal_url:
-            # Try known FlyNet portal domains
-            for domain in FLYNET_PORTAL_DOMAINS:
-                code, body, elapsed = http_get(f"https://{domain}/", timeout=5)
-                if code and code != 0:
-                    info.portal_url = f"https://{domain}"
-                    break
+class Provider:
+    """Base class for inflight WiFi providers.
 
-        # Try to discover FlyNet API base
-        for base in ["https://www.lufthansa-flynet.com",
-                      "https://wlan.onboard.lufthansa.com",
-                      "https://flynet.lufthansa.com"]:
-            code, body, _ = http_get(f"{base}/api/flightData", timeout=3)
-            if code == 200:
-                info.api_base = base
-                break
-            code, body, _ = http_get(f"{base}/api/v1/flightData", timeout=3)
-            if code == 200:
-                info.api_base = base
-                break
+    Subclass this, implement detect() / discover_api_base() / fetch_*(),
+    and append an instance to PROVIDERS.
 
-        return info
+    Confidence convention for detect():
+      50–60  strong   (vendor MAC OUI, TLS cert SAN, vendor Server header)
+      25–40  medium   (DNS search domain, captive-portal redirect)
+       5–20  weak     (ARP hostname, SSID heuristic)
+    Multiple signals stack (sum, capped at 100). Floor for a non-Unknown
+    match is DETECT_FLOOR; below that the system stays "Unknown"."""
 
-    # --- Detect Panasonic Avionics (TAP, KLM, Air France, SWISS, etc.) ---
-    is_panasonic = mac_prefix in PAC_OUI_PREFIXES
-    is_onboard = "onboardwifi" in info.dns_domain.lower() if info.dns_domain else False
-    flytap = any("flytap" in c.get("hostname", "") for c in clients)
-    has_pac = any("airpana" in c.get("hostname", "") or "panasonic" in c.get("hostname", "") for c in clients)
-    swiss_dns = "swissconnect" in info.dns_domain.lower() if info.dns_domain else False
+    name: str = "Unknown"
+    hardware: str = ""
+    discovery_domains: list[str] = []  # used as candidate hosts by --probe / --probe-deep
 
-    # Last resort: hit the gateway and look for "PAC Web Server" header
-    pac_server_hint = False
-    if not (is_panasonic or is_onboard or flytap or has_pac or swiss_dns) and info.gateway_ip:
-        try:
-            _, hdrs, _, _ = _fetch_with_headers(f"https://{info.gateway_ip}/", timeout=4)
-            if "PAC" in hdrs.get("Server", ""):
-                pac_server_hint = True
-        except Exception:
-            pass
+    def detect(self, sig: NetworkSignals) -> Optional[Match]:
+        """Return a Match if this network is yours, else None."""
+        return None
 
-    if is_panasonic or is_onboard or flytap or has_pac or swiss_dns or pac_server_hint:
-        info.provider = "Panasonic Avionics"
-        info.hardware = "Matsushita/Panasonic Avionics"
-        info.api_base = PAC_API_BASE
+    def discover_api_base(self, sig: NetworkSignals) -> Optional[str]:
+        """Return the provider's API base URL on this network, or None."""
+        return None
 
-        # Detect airline from ARP hostnames + DNS domain
-        if swiss_dns:
-            info.airline = "SWISS"
-        for c in clients:
-            h = c.get("hostname", "").lower()
-            if "onboardwifi" in h:
-                info.portal_url = f"https://{c['hostname']}"
-            if "flytap" in h:
-                info.airline = "TAP Air Portugal"
-            elif "klm" in h:
-                info.airline = "KLM"
-            elif "airfrance" in h:
-                info.airline = "Air France"
-            elif "swiss" in h:
-                info.airline = "SWISS"
+    def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
+        """Optional: enrich SystemInfo after detection (e.g. provider-specific URLs)."""
+        return None
 
-        # If no portal found yet, try DNS-search-domain wildcards
+    def fetch_flight(self, api_base: str) -> Optional[FlightData]:
+        return None
+
+    def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
+        return None
+
+    def fetch_device_state(self, api_base: str) -> Optional[DeviceState]:
+        return None
+
+    def fetch_wisp_products(self, api_base: str) -> list[WISPProduct]:
+        return []
+
+    def airline_from_flight_number(self, flight_number: str) -> str:
+        """Optional: map a flight-number prefix to an airline name."""
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Panasonic Avionics — TAP, KLM, Air France, SWISS (777), …
+# ---------------------------------------------------------------------------
+
+class PanasonicProvider(Provider):
+    name = "Panasonic Avionics"
+    hardware = "Matsushita/Panasonic Avionics"
+    api_base = "https://api.airpana.com/inflight/services"
+    oui_prefixes = ["00:0d:2e"]  # Matsushita / Panasonic Avionics
+
+    def detect(self, sig: NetworkSignals) -> Optional[Match]:
+        confidence = 0
+        airline = ""
+        portal_url = ""
+
+        if sig.gateway_mac_oui in self.oui_prefixes:
+            confidence += 60
+        dns = sig.dns_domain.lower()
+        if "onboardwifi" in dns:
+            confidence += 30
+        if "swissconnect" in dns:
+            confidence += 30
+            airline = "SWISS"
+        for c in sig.arp_clients:
+            host = c.get("hostname", "").lower()
+            if "airpana" in host or "panasonic" in host:
+                confidence += 50
+            if "flytap" in host:
+                confidence += 20
+                airline = airline or "TAP Air Portugal"
+            elif "klm" in host:
+                airline = airline or "KLM"
+            elif "airfrance" in host:
+                airline = airline or "Air France"
+            elif "swiss" in host:
+                airline = airline or "SWISS"
+            if "onboardwifi" in host:
+                portal_url = f"https://{c['hostname']}"
+
+        # Last-resort: hit the gateway and look for "PAC Web Server" header.
+        # Only fired if cheap signals didn't already match (saves an HTTP call).
+        if confidence == 0 and sig.gateway_ip:
+            try:
+                _, hdrs, _, _ = _fetch_with_headers(f"https://{sig.gateway_ip}/", timeout=4)
+                if "PAC" in hdrs.get("Server", ""):
+                    confidence += 50
+            except Exception:
+                pass
+
+        if confidence == 0:
+            return None
+        return Match(confidence=min(confidence, 100), airline=airline, portal_url=portal_url)
+
+    def discover_api_base(self, sig: NetworkSignals) -> Optional[str]:
+        return self.api_base
+
+    def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
+        # Try DNS-search-domain wildcards for a portal URL if not already found
         if not info.portal_url and info.dns_domain:
             for sub in ("portal", "www", "wifi", "captive", "onboard"):
                 code, _, _ = http_get(f"https://{sub}.{info.dns_domain}/", timeout=3)
                 if code and code not in (0, 404):
                     info.portal_url = f"https://{sub}.{info.dns_domain}"
                     break
-
-        if not info.proxy:
-            _, proxy_info, _ = _detect_captive_portal()
-            if proxy_info:
-                info.proxy = proxy_info
-
-        wisp, _ = http_get_json(f"{PAC_API_BASE}/exconnect/v1/wisp?lang=en")
+        wisp, _ = http_get_json(f"{self.api_base}/exconnect/v1/wisp?lang=en")
         if wisp and "url" in wisp:
             info.pac_wisp_url = wisp["url"]
 
+    def fetch_flight(self, api_base: str) -> Optional[FlightData]:
+        data, _ = http_get_json(f"{api_base}/flightdata/v2/flightdata")
+        if not data:
+            return None
+        fd = FlightData()
+        fd.flight_number = data.get("flight_number", "")
+        fd.departure_iata = data.get("departure_iata", "")
+        fd.departure_icao = data.get("departure_icao", "")
+        fd.destination_iata = data.get("destination_iata", "")
+        fd.destination_icao = data.get("destination_icao", "")
+        fd.aircraft_type = data.get("aircraft_type", "")
+        fd.tail_number = data.get("tail_number", "")
+        fd.ground_speed_kts = data.get("ground_speed_knots", 0) or 0
+        fd.altitude_ft = data.get("altitude_feet", 0) or 0
+        fd.heading_deg = data.get("true_heading_degree", 0) or 0
+        fd.outside_temp_c = data.get("outside_air_temp_celsius", 0) or 0
+        coords = data.get("current_coordinates", {})
+        fd.latitude = coords.get("latitude", 0.0) or 0.0
+        fd.longitude = coords.get("longitude", 0.0) or 0.0
+        dep_coords = data.get("departure_coordinates", {})
+        fd.departure_lat = dep_coords.get("latitude", 0.0) or 0.0
+        fd.departure_lon = dep_coords.get("longitude", 0.0) or 0.0
+        dst_coords = data.get("destination_coordinates", {})
+        fd.destination_lat = dst_coords.get("latitude", 0.0) or 0.0
+        fd.destination_lon = dst_coords.get("longitude", 0.0) or 0.0
+        fd.time_to_dest_min = data.get("time_to_destination_minutes", 0) or 0
+        fd.distance_to_dest_nm = data.get("distance_to_destination_nautical_miles", 0) or 0
+        fd.distance_from_origin_nm = data.get("distance_from_departure_nautical_miles", 0) or 0
+        fd.distance_covered_pct = data.get("distance_covered_percentage", 0) or 0
+        fd.flight_phase = data.get("flight_phase", "")
+        fd.takeoff_time_utc = data.get("takeoff_time_utc", "")
+        fd.estimated_arrival_utc = data.get("estimated_arrival_time_utc", "")
+        fd.current_utc_date = data.get("current_utc_date", "")
+        fd.flight_state = data.get("flight_state", "")
+        fd.weight_on_wheels = data.get("weight_on_wheels", False)
+        fd.all_doors_closed = data.get("all_doors_closed", False)
+        return fd
+
+    def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
+        data, _ = http_get_json(f"{api_base}/exconnect/v1/status")
+        if not data:
+            return None
+        cs = ConnectivityStatus()
+        cs.global_conn_enabled = data.get("global_conn_enabled", False)
+        cs.internet_connectivity = data.get("internet_connectivity_status", False)
+        cs.time_until_coverage_change = data.get("time_until_coverage_change", 0) or 0
+        cs.total_coverage_remaining = data.get("total_coverage_remaining", 0) or 0
+        return cs
+
+    def fetch_device_state(self, api_base: str) -> Optional[DeviceState]:
+        data, _ = http_get_json(f"{api_base}/exconnect/v1/device_state")
+        if not data:
+            return None
+        return DeviceState(status=data.get("status", "UNKNOWN"), enabled=data.get("enabled", False))
+
+    def fetch_wisp_products(self, api_base: str) -> list[WISPProduct]:
+        data, _ = http_get_json(f"{api_base}/exconnect/v1/wisp_product_info?lang=en")
+        if not data or "data" not in data:
+            return []
+        products = []
+        for item in data["data"]:
+            p = WISPProduct()
+            p.id = item.get("id", 0)
+            name = item.get("name", {})
+            p.name = name.get("eng", "") if isinstance(name, dict) else str(name)
+            desc = item.get("description", {})
+            p.description = desc.get("eng", "") if isinstance(desc, dict) else str(desc)
+            price = item.get("price", {})
+            eur = price.get("eur", {}) if isinstance(price, dict) else {}
+            p.price_eur = eur.get("amount", 0) if isinstance(eur, dict) else 0
+            products.append(p)
+        return products
+
+
+# ---------------------------------------------------------------------------
+# Lufthansa Group FlyNet — SWISS, Lufthansa, Austrian, Eurowings
+# (Detection + parser stubs; not yet verified on a live aircraft.)
+# ---------------------------------------------------------------------------
+
+class FlynetProvider(Provider):
+    name = "Lufthansa Group FlyNet"
+    hardware = "Deutsche Telekom / EAN or Inmarsat Ka"
+    ssids = ["telekom_flynet", "flynet", "lufthansa flynet", "swiss connect", "swissconnect"]
+    discovery_domains = ["lufthansa-flynet.com", "flynet.lufthansa.com",
+                         "wlan.onboard.lufthansa.com",
+                         "swissconnect.com", "www.swissconnect.com",
+                         "portal.swissconnect.com", "api.swissconnect.com"]
+    api_base_candidates = [
+        "https://www.lufthansa-flynet.com",
+        "https://wlan.onboard.lufthansa.com",
+        "https://flynet.lufthansa.com",
+    ]
+    flight_paths = [
+        "/api/flightData", "/api/v1/flightData",
+        "/api/v1/flight-info", "/api/flight", "/flightInfo",
+    ]
+    connectivity_paths = ["/api/connectivity", "/api/v1/connectivity",
+                          "/api/status", "/api/v1/status", "/api/network"]
+    airlines_by_prefix = {
+        "LX": "SWISS", "LH": "Lufthansa", "OS": "Austrian Airlines",
+        "EW": "Eurowings", "WK": "Edelweiss Air",
+    }
+
+    def detect(self, sig: NetworkSignals) -> Optional[Match]:
+        confidence = 0
+        portal_url = ""
+        if sig.ssid.lower().strip() in self.ssids:
+            confidence += 50
+        dns = sig.dns_domain.lower()
+        if any(d in dns for d in ["flynet", "telekom", "lufthansa"]):
+            confidence += 40
+        if sig.portal_url:
+            for d in self.discovery_domains:
+                if d in sig.portal_url:
+                    confidence += 40
+                    portal_url = sig.portal_url
+                    break
+
+        if confidence == 0:
+            return None
+        return Match(confidence=min(confidence, 100), portal_url=portal_url)
+
+    def discover_api_base(self, sig: NetworkSignals) -> Optional[str]:
+        for base in self.api_base_candidates:
+            for path in ("/api/flightData", "/api/v1/flightData"):
+                code, _, _ = http_get(f"{base}{path}", timeout=3)
+                if code == 200:
+                    return base
+        return None
+
+    def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
+        # Fall back to any reachable known portal if we still don't have one
+        if not info.portal_url:
+            for domain in self.discovery_domains:
+                code, _, _ = http_get(f"https://{domain}/", timeout=5)
+                if code and code != 0:
+                    info.portal_url = f"https://{domain}"
+                    break
+
+    def fetch_flight(self, api_base: str) -> Optional[FlightData]:
+        for path in self.flight_paths:
+            data, _ = http_get_json(f"{api_base}{path}")
+            if data:
+                return self._parse_flight(data)
+
+        # Some FlyNet portals embed flight data in the main page as JSON
+        code, body, _ = http_get(api_base, timeout=5)
+        if code == 200 and body:
+            for m in re.finditer(r'(?:flightData|flightInfo|flight_data)\s*[=:]\s*(\{[^;]{20,2000}\})', body):
+                try:
+                    data = json.loads(m.group(1))
+                    fd = self._parse_flight(data)
+                    if fd and fd.flight_number:
+                        return fd
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return None
+
+    def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
+        for path in self.connectivity_paths:
+            data, _ = http_get_json(f"{api_base}{path}")
+            if data:
+                cs = ConnectivityStatus()
+                cs.internet_connectivity = bool(data.get("connected") or data.get("online")
+                                                or data.get("internetAvailable") or True)
+                cs.global_conn_enabled = bool(data.get("enabled") or data.get("serviceAvailable")
+                                              or True)
+                return cs
+        # If portal is reachable at all, connectivity is likely up
+        code, _, _ = http_get(api_base, timeout=3)
+        if code and code < 500:
+            cs = ConnectivityStatus()
+            cs.internet_connectivity = True
+            cs.global_conn_enabled = True
+            return cs
+        return None
+
+    def airline_from_flight_number(self, flight_number: str) -> str:
+        return self.airlines_by_prefix.get(flight_number[:2], "")
+
+    @staticmethod
+    def _num(d: dict, *keys) -> float:
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    continue
+        return 0
+
+    def _parse_flight(self, data: dict) -> Optional[FlightData]:
+        """Parse FlyNet flight data — handles multiple known JSON shapes."""
+        if not data:
+            return None
+        fd = FlightData()
+        fd.flight_number = (data.get("flightNumber") or data.get("flight_number")
+                            or data.get("fn") or "")
+        fd.departure_iata = (data.get("departureAirportCode") or data.get("departure")
+                             or data.get("dep") or data.get("origin", {}).get("code", "") or "")
+        fd.destination_iata = (data.get("arrivalAirportCode") or data.get("destination")
+                               or data.get("dst") or data.get("destination", {}).get("code", "") or "")
+        fd.aircraft_type = data.get("aircraftType") or data.get("aircraft_type") or ""
+        fd.tail_number = data.get("tailNumber") or data.get("registration") or ""
+
+        fd.ground_speed_kts = int(self._num(data, "groundSpeed", "ground_speed", "speed") or 0)
+        fd.altitude_ft = int(self._num(data, "altitude", "altitudeFeet") or 0)
+        fd.heading_deg = int(self._num(data, "heading", "trueHeading") or 0)
+        fd.outside_temp_c = int(self._num(data, "outsideTemperature", "oat", "temperature") or 0)
+
+        fd.latitude = self._num(data, "latitude", "lat") or 0.0
+        fd.longitude = self._num(data, "longitude", "lng", "lon") or 0.0
+        pos = data.get("position") or data.get("currentPosition") or {}
+        if isinstance(pos, dict):
+            fd.latitude = fd.latitude or self._num(pos, "latitude", "lat") or 0.0
+            fd.longitude = fd.longitude or self._num(pos, "longitude", "lng", "lon") or 0.0
+
+        fd.time_to_dest_min = int(self._num(data, "timeToDestination", "remainingTime",
+                                           "estimatedTimeRemaining") or 0)
+        fd.distance_to_dest_nm = int(self._num(data, "distanceToDestination", "remainingDistance") or 0)
+        fd.distance_covered_pct = int(self._num(data, "progress", "percentComplete") or 0)
+        fd.estimated_arrival_utc = (data.get("estimatedArrival") or data.get("eta")
+                                    or data.get("arrivalTime") or "")
+
+        dep = data.get("departureAirport") or data.get("origin") or {}
+        if isinstance(dep, dict):
+            fd.departure_lat = self._num(dep, "latitude", "lat") or 0.0
+            fd.departure_lon = self._num(dep, "longitude", "lng", "lon") or 0.0
+        dst = data.get("arrivalAirport") or data.get("destination") or {}
+        if isinstance(dst, dict) and dst.get("latitude") is not None:
+            fd.destination_lat = self._num(dst, "latitude", "lat") or 0.0
+            fd.destination_lon = self._num(dst, "longitude", "lng", "lon") or 0.0
+        return fd
+
+
+# ---------------------------------------------------------------------------
+# Provider registry — append to add a system; order does not matter.
+# ---------------------------------------------------------------------------
+
+PROVIDERS: list[Provider] = [
+    PanasonicProvider(),
+    FlynetProvider(),
+]
+
+DETECT_FLOOR = 30   # minimum confidence for a non-Unknown match
+
+
+def _provider_for(name: str) -> Optional[Provider]:
+    return next((p for p in PROVIDERS if p.name == name), None)
+
+
+def detect_system() -> SystemInfo:
+    """Detect which inflight WiFi system this network belongs to."""
+    sig = NetworkSignals.gather()
+    info = SystemInfo(
+        ssid=sig.ssid,
+        gateway_ip=sig.gateway_ip,
+        gateway_mac=sig.gateway_mac,
+        local_ip=sig.local_ip,
+        subnet=sig.subnet,
+        dns_domain=sig.dns_domain,
+        portal_url=sig.portal_url,
+        proxy=sig.proxy,
+    )
+
+    best_provider: Optional[Provider] = None
+    best_match: Optional[Match] = None
+    for p in PROVIDERS:
+        m = p.detect(sig)
+        if m and (best_match is None or m.confidence > best_match.confidence):
+            best_provider, best_match = p, m
+
+    if best_provider is None or best_match is None or best_match.confidence < DETECT_FLOOR:
         return info
 
-    # --- Unknown system: try captive portal detection ---
-    if not info.portal_url:
-        portal_url, proxy_info, _ = _detect_captive_portal()
-        if portal_url:
-            info.portal_url = portal_url
-        if proxy_info:
-            info.proxy = proxy_info
-
+    info.provider = best_provider.name
+    info.hardware = best_match.hardware or best_provider.hardware
+    if best_match.airline:
+        info.airline = best_match.airline
+    if best_match.portal_url:
+        info.portal_url = best_match.portal_url
+    if best_match.proxy:
+        info.proxy = best_match.proxy
+    info.api_base = best_provider.discover_api_base(sig) or ""
+    best_provider.post_detect(info, sig)
     return info
-
-
-# ---------------------------------------------------------------------------
-# PAC API fetchers
-# ---------------------------------------------------------------------------
-
-def fetch_flight_data(api_base: str) -> Optional[FlightData]:
-    data, _ = http_get_json(f"{api_base}/flightdata/v2/flightdata")
-    if not data:
-        return None
-    fd = FlightData()
-    fd.flight_number = data.get("flight_number", "")
-    fd.departure_iata = data.get("departure_iata", "")
-    fd.departure_icao = data.get("departure_icao", "")
-    fd.destination_iata = data.get("destination_iata", "")
-    fd.destination_icao = data.get("destination_icao", "")
-    fd.aircraft_type = data.get("aircraft_type", "")
-    fd.tail_number = data.get("tail_number", "")
-    fd.ground_speed_kts = data.get("ground_speed_knots", 0) or 0
-    fd.altitude_ft = data.get("altitude_feet", 0) or 0
-    fd.heading_deg = data.get("true_heading_degree", 0) or 0
-    fd.outside_temp_c = data.get("outside_air_temp_celsius", 0) or 0
-    coords = data.get("current_coordinates", {})
-    fd.latitude = coords.get("latitude", 0.0) or 0.0
-    fd.longitude = coords.get("longitude", 0.0) or 0.0
-    dep_coords = data.get("departure_coordinates", {})
-    fd.departure_lat = dep_coords.get("latitude", 0.0) or 0.0
-    fd.departure_lon = dep_coords.get("longitude", 0.0) or 0.0
-    dst_coords = data.get("destination_coordinates", {})
-    fd.destination_lat = dst_coords.get("latitude", 0.0) or 0.0
-    fd.destination_lon = dst_coords.get("longitude", 0.0) or 0.0
-    fd.time_to_dest_min = data.get("time_to_destination_minutes", 0) or 0
-    fd.distance_to_dest_nm = data.get("distance_to_destination_nautical_miles", 0) or 0
-    fd.distance_from_origin_nm = data.get("distance_from_departure_nautical_miles", 0) or 0
-    fd.distance_covered_pct = data.get("distance_covered_percentage", 0) or 0
-    fd.flight_phase = data.get("flight_phase", "")
-    fd.takeoff_time_utc = data.get("takeoff_time_utc", "")
-    fd.estimated_arrival_utc = data.get("estimated_arrival_time_utc", "")
-    fd.current_utc_date = data.get("current_utc_date", "")
-    fd.flight_state = data.get("flight_state", "")
-    fd.weight_on_wheels = data.get("weight_on_wheels", False)
-    fd.all_doors_closed = data.get("all_doors_closed", False)
-    return fd
-
-
-def fetch_connectivity(api_base: str) -> Optional[ConnectivityStatus]:
-    data, _ = http_get_json(f"{api_base}/exconnect/v1/status")
-    if not data:
-        return None
-    cs = ConnectivityStatus()
-    cs.global_conn_enabled = data.get("global_conn_enabled", False)
-    cs.internet_connectivity = data.get("internet_connectivity_status", False)
-    cs.time_until_coverage_change = data.get("time_until_coverage_change", 0) or 0
-    cs.total_coverage_remaining = data.get("total_coverage_remaining", 0) or 0
-    return cs
-
-
-def fetch_device_state(api_base: str) -> Optional[DeviceState]:
-    data, _ = http_get_json(f"{api_base}/exconnect/v1/device_state")
-    if not data:
-        return None
-    return DeviceState(status=data.get("status", "UNKNOWN"), enabled=data.get("enabled", False))
-
-
-def fetch_wisp_products(api_base: str) -> list[WISPProduct]:
-    data, _ = http_get_json(f"{api_base}/exconnect/v1/wisp_product_info?lang=en")
-    if not data or "data" not in data:
-        return []
-    products = []
-    for item in data["data"]:
-        p = WISPProduct()
-        p.id = item.get("id", 0)
-        name = item.get("name", {})
-        p.name = name.get("eng", "") if isinstance(name, dict) else str(name)
-        desc = item.get("description", {})
-        p.description = desc.get("eng", "") if isinstance(desc, dict) else str(desc)
-        price = item.get("price", {})
-        eur = price.get("eur", {}) if isinstance(price, dict) else {}
-        p.price_eur = eur.get("amount", 0) if isinstance(eur, dict) else 0
-        products.append(p)
-    return products
-
-
-# ---------------------------------------------------------------------------
-# FlyNet (Lufthansa Group) API fetchers
-# ---------------------------------------------------------------------------
-
-def flynet_fetch_flight_data(api_base: str) -> Optional[FlightData]:
-    """Try multiple known FlyNet API path patterns for flight data."""
-    paths = [
-        "/api/flightData",
-        "/api/v1/flightData",
-        "/api/v1/flight-info",
-        "/api/flight",
-        "/flightInfo",
-    ]
-    for path in paths:
-        data, _ = http_get_json(f"{api_base}{path}")
-        if data:
-            return _parse_flynet_flight(data)
-
-    # Some FlyNet portals embed flight data in the main page as JSON
-    code, body, _ = http_get(api_base, timeout=5)
-    if code == 200 and body:
-        # Look for JSON embedded in script tags
-        for m in re.finditer(r'(?:flightData|flightInfo|flight_data)\s*[=:]\s*(\{[^;]{20,2000}\})', body):
-            try:
-                data = json.loads(m.group(1))
-                fd = _parse_flynet_flight(data)
-                if fd and fd.flight_number:
-                    return fd
-            except (json.JSONDecodeError, ValueError):
-                continue
-    return None
-
-
-def _parse_flynet_flight(data: dict) -> Optional[FlightData]:
-    """Parse FlyNet flight data — handles multiple known JSON shapes."""
-    if not data:
-        return None
-    fd = FlightData()
-
-    # Try common key patterns (FlyNet format varies by version)
-    fd.flight_number = (data.get("flightNumber") or data.get("flight_number")
-                        or data.get("fn") or "")
-    fd.departure_iata = (data.get("departureAirportCode") or data.get("departure")
-                         or data.get("dep") or data.get("origin", {}).get("code", "") or "")
-    fd.destination_iata = (data.get("arrivalAirportCode") or data.get("destination")
-                           or data.get("dst") or data.get("destination", {}).get("code", "") or "")
-    fd.aircraft_type = data.get("aircraftType") or data.get("aircraft_type") or ""
-    fd.tail_number = data.get("tailNumber") or data.get("registration") or ""
-
-    fd.ground_speed_kts = int(_num(data, "groundSpeed", "ground_speed", "speed") or 0)
-    fd.altitude_ft = int(_num(data, "altitude", "altitudeFeet") or 0)
-    fd.heading_deg = int(_num(data, "heading", "trueHeading") or 0)
-    fd.outside_temp_c = int(_num(data, "outsideTemperature", "oat", "temperature") or 0)
-
-    # Position
-    fd.latitude = _num(data, "latitude", "lat") or 0.0
-    fd.longitude = _num(data, "longitude", "lng", "lon") or 0.0
-
-    # Some FlyNet embeds position as nested object
-    pos = data.get("position") or data.get("currentPosition") or {}
-    if isinstance(pos, dict):
-        fd.latitude = fd.latitude or _num(pos, "latitude", "lat") or 0.0
-        fd.longitude = fd.longitude or _num(pos, "longitude", "lng", "lon") or 0.0
-
-    fd.time_to_dest_min = int(_num(data, "timeToDestination", "remainingTime",
-                                  "estimatedTimeRemaining") or 0)
-    fd.distance_to_dest_nm = int(_num(data, "distanceToDestination", "remainingDistance") or 0)
-    fd.distance_covered_pct = int(_num(data, "progress", "percentComplete") or 0)
-
-    fd.estimated_arrival_utc = (data.get("estimatedArrival") or data.get("eta")
-                                or data.get("arrivalTime") or "")
-
-    # Departure/destination coordinates
-    dep = data.get("departureAirport") or data.get("origin") or {}
-    if isinstance(dep, dict):
-        fd.departure_lat = _num(dep, "latitude", "lat") or 0.0
-        fd.departure_lon = _num(dep, "longitude", "lng", "lon") or 0.0
-    dst = data.get("arrivalAirport") or data.get("destination") or {}
-    if isinstance(dst, dict) and dst.get("latitude") is not None:
-        fd.destination_lat = _num(dst, "latitude", "lat") or 0.0
-        fd.destination_lon = _num(dst, "longitude", "lng", "lon") or 0.0
-
-    return fd
-
-
-def _num(d: dict, *keys) -> float:
-    """Get first numeric value found under any of the given keys."""
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            try:
-                return float(v)
-            except (ValueError, TypeError):
-                continue
-    return 0
-
-
-def flynet_fetch_connectivity(api_base: str) -> Optional[ConnectivityStatus]:
-    """Try to get connectivity status from FlyNet."""
-    paths = ["/api/connectivity", "/api/v1/connectivity", "/api/status",
-             "/api/v1/status", "/api/network"]
-    for path in paths:
-        data, _ = http_get_json(f"{api_base}{path}")
-        if data:
-            cs = ConnectivityStatus()
-            cs.internet_connectivity = bool(data.get("connected") or data.get("online")
-                                            or data.get("internetAvailable") or True)
-            cs.global_conn_enabled = bool(data.get("enabled") or data.get("serviceAvailable")
-                                          or True)
-            return cs
-    # If portal is reachable at all, connectivity is likely up
-    code, _, _ = http_get(api_base, timeout=3)
-    if code and code < 500:
-        cs = ConnectivityStatus()
-        cs.internet_connectivity = True
-        cs.global_conn_enabled = True
-        return cs
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -772,9 +888,10 @@ def probe_system(sys_info: SystemInfo) -> list[dict]:
         bases.append(f"http://{sys_info.gateway_ip}")
         bases.append(f"https://{sys_info.gateway_ip}")
 
-    # Add known portal domains to try
-    for domain in FLYNET_PORTAL_DOMAINS:
-        bases.append(f"https://{domain}")
+    # Add provider-declared discovery domains as candidate bases
+    for prov in PROVIDERS:
+        for domain in prov.discovery_domains:
+            bases.append(f"https://{domain}")
 
     # Common API paths found across inflight wifi systems
     api_paths = [
@@ -1121,8 +1238,9 @@ def run_deep_probe(sys_info: SystemInfo):
         for sub in ("portal", "www", "api", "wifi", "captive", "onboard", "connect"):
             targets.append(f"https://{sub}.{sys_info.dns_domain}")
         targets.append(f"https://{sys_info.dns_domain}")
-    for d in FLYNET_PORTAL_DOMAINS:
-        targets.append(f"https://{d}")
+    for prov in PROVIDERS:
+        for d in prov.discovery_domains:
+            targets.append(f"https://{d}")
     # Dedup preserving order
     seen = set()
     targets = [t for t in targets if not (t in seen or seen.add(t))]
@@ -1432,6 +1550,7 @@ def detect_issues(snap: Snapshot, sys_info: SystemInfo) -> list[dict]:
 class DataCollector:
     def __init__(self, sys_info: SystemInfo):
         self.sys_info = sys_info
+        self.provider: Optional[Provider] = _provider_for(sys_info.provider)
         self.history: collections.deque[Snapshot] = collections.deque(maxlen=HISTORY_MAX)
         self.products: list[WISPProduct] = []
         self.coverage_events: list[CoverageEvent] = []
@@ -1455,29 +1574,26 @@ class DataCollector:
         api = self.sys_info.api_base
 
         try:
-            # Fast API calls — dispatch by provider
-            is_flynet = "FlyNet" in self.sys_info.provider
-            if is_flynet and api:
-                snap.flight = flynet_fetch_flight_data(api)
-                snap.connectivity = flynet_fetch_connectivity(api)
-            elif api:
-                snap.flight = fetch_flight_data(api)
-                snap.connectivity = fetch_connectivity(api)
-                snap.device = fetch_device_state(api)
+            # Fast API calls — dispatch through the matched provider
+            if self.provider and api:
+                snap.flight = self.provider.fetch_flight(api)
+                snap.connectivity = self.provider.fetch_connectivity(api)
+                snap.device = self.provider.fetch_device_state(api)
 
             # Detect airline from flight number if not already set
-            if snap.flight and snap.flight.flight_number and not self.sys_info.airline:
-                prefix = snap.flight.flight_number[:2]
-                if prefix in FLYNET_AIRLINES:
-                    self.sys_info.airline = FLYNET_AIRLINES[prefix]
+            if (snap.flight and snap.flight.flight_number
+                    and not self.sys_info.airline and self.provider):
+                al = self.provider.airline_from_flight_number(snap.flight.flight_number)
+                if al:
+                    self.sys_info.airline = al
 
             # Track satellite coverage state transitions
             if snap.connectivity:
                 self._track_coverage(snap.connectivity, snap.timestamp)
 
-            # Fetch products once (PAC only for now)
-            if not self._products_fetched and not is_flynet:
-                self.products = fetch_wisp_products(api) if api else []
+            # Fetch products once (providers return [] if they don't expose this)
+            if not self._products_fetched and self.provider and api:
+                self.products = self.provider.fetch_wisp_products(api)
                 self._products_fetched = True
 
             # Network measurements

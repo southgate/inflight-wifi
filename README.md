@@ -90,14 +90,15 @@ If any of these match, the rest of the Panasonic codepath kicks in and you get f
 
 Single file, single process, no external dependencies.
 
-- **`detect_system()`** — five-signal classifier (above)
-- **`fetch_flight_data()` / `fetch_connectivity()` / `fetch_device_state()` / `fetch_wisp_products()`** — Panasonic API fetchers (`api.airpana.com/inflight/services/...`)
-- **`flynet_*` family** — Lufthansa FlyNet stubs, schema-tolerant parser that handles multiple JSON shapes
-- **`run_diagnostics()`** — ICMP + HTTPS + DNS + throughput probes
-- **`DataCollector`** — ring buffer of `Snapshot`s, satellite coverage event tracker
-- **`render_map()`** — ASCII world map with simplified coastline polylines and `great_circle_point()` interpolation
-- **`TUI`** — curses front-end, threaded background collection, six views
-- **`run_deep_probe()`** — endpoint discovery: HTML scrape (CSP, preconnect, embedded JSON, data attrs), JS bundle mining (URL constants, builder functions, WebSockets), TLS cert SAN via `openssl`, well-known files, port scan
+- **`NetworkSignals.gather()`** — one-shot capture of WiFi info, ARP table, DNS search domain, gateway MAC, captive-portal redirect. Providers read these; they don't re-fetch.
+- **`Provider`** — base class. Each inflight system is a subclass implementing `detect()` (returns a `Match` with a confidence score), `discover_api_base()`, and `fetch_flight()` / `fetch_connectivity()` / `fetch_device_state()` / `fetch_wisp_products()`. Defaults return `None`/`[]`, so providers only override what they expose.
+- **`PROVIDERS`** — registry list. `detect_system()` runs each provider against the gathered signals, picks the highest-confidence `Match` above `DETECT_FLOOR` (30), and stamps the result onto `SystemInfo`.
+- **`PanasonicProvider`** — TAP, KLM, Air France, SWISS. Constants (`oui_prefixes`, `api_base`) live as class attributes. API: `api.airpana.com/inflight/services/...`.
+- **`FlynetProvider`** — Lufthansa Group stubs. Schema-tolerant parser that handles multiple JSON shapes; probes several candidate API bases since FlyNet's portal hostname varies.
+- **`DataCollector`** — ring buffer of `Snapshot`s, satellite coverage event tracker. Dispatches through `self.provider.fetch_*()` — no per-provider branching.
+- **`render_map()`** — ASCII world map with simplified coastline polylines and `great_circle_point()` interpolation.
+- **`TUI`** — curses front-end, threaded background collection, six views.
+- **`run_deep_probe()`** — endpoint discovery: HTML scrape (CSP, preconnect, embedded JSON, data attrs), JS bundle mining (URL constants, builder functions, WebSockets), TLS cert SAN via `openssl`, well-known files, port scan. Discovery candidates are walked from `provider.discovery_domains` so adding a provider also extends probe coverage.
 
 ## A few hard-earned lessons
 
@@ -109,11 +110,100 @@ Single file, single process, no external dependencies.
 
 ## Adding support for a new system
 
-1. Connect to the airline WiFi and run `python3 inflightd.py --probe-deep`. Save the output.
-2. Look for: a unique DNS search domain, distinctive `Server` header, JS bundles with URL builders (e.g., `makeServiceURL`), CSP-allowed hosts, embedded JSON state.
-3. Add a detection branch in `detect_system()` (it's a flat if/elif chain).
-4. Add a `<system>_fetch_flight_data()` / `_fetch_connectivity()` pair. If the schema is very different, follow the `flynet_*` pattern — try multiple endpoint paths, then a flexible parser that handles several JSON shapes.
-5. Send a PR with a redacted probe output and the live `--report` to confirm.
+The tool is built around a `Provider` base class and a `PROVIDERS` registry. Adding a new airline/system means writing one subclass and appending it to the list — no edits to `detect_system()` or `DataCollector`.
+
+### 1. Reconnaissance
+
+Connect to the airline WiFi and run:
+
+```sh
+python3 inflightd.py --probe-deep
+```
+
+Look in the output for:
+
+- A unique **DNS search domain** (e.g. `onboardwifi`, `swissconnectforguests`)
+- A distinctive **`Server` header** on the gateway (Panasonic's is `PAC Web Server`)
+- **TLS cert SANs** on the gateway or portal — often a dead giveaway (e.g. `api.airpana.com`)
+- **CSP / preconnect** headers and **JS bundle URL builders** like `makeServiceURL`, `apiBase`, `BASE_URL`
+- The **gateway MAC OUI** — vendor-assigned, harder to spoof than anything else
+- The **captive-portal redirect** — what host does Apple's captive probe get redirected to?
+
+### 2. Implement a Provider subclass
+
+In `inflightd.py`, subclass `Provider`. Only override what you need; defaults return `None` / `[]`.
+
+```python
+class MyAirlineProvider(Provider):
+    name = "MyAirline Inflight"
+    hardware = "Vendor Hardware Name"
+    discovery_domains = ["portal.myairline.com"]   # for --probe / --probe-deep
+
+    def detect(self, sig: NetworkSignals) -> Optional[Match]:
+        confidence = 0
+        if sig.gateway_mac_oui == "aa:bb:cc":
+            confidence += 60                       # MAC OUI is a strong signal
+        if "myairline" in sig.dns_domain.lower():
+            confidence += 30                       # DNS search domain
+        if any("myairline" in c.get("hostname", "") for c in sig.arp_clients):
+            confidence += 15                       # weak: ARP hostname hint
+        if confidence == 0:
+            return None
+        return Match(confidence=min(confidence, 100))
+
+    def discover_api_base(self, sig: NetworkSignals) -> Optional[str]:
+        # Return a constant if well-known, or probe candidates and return the first that responds
+        return "https://api.myairline.com"
+
+    def fetch_flight(self, api_base: str) -> Optional[FlightData]:
+        data, _ = http_get_json(f"{api_base}/flight")
+        if not data:
+            return None
+        fd = FlightData()
+        fd.flight_number = data.get("flightNumber", "")
+        # …map the rest of the fields
+        return fd
+
+    def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
+        ...
+```
+
+**Confidence scoring.** `detect()` returns a `Match` with a 0–100 score. The convention:
+
+| Signal | Range |
+| --- | --- |
+| Vendor MAC OUI / TLS cert SAN / vendor `Server` header | 50–60 (strong) |
+| DNS search domain / captive-portal redirect to known host | 25–40 (medium) |
+| ARP hostname hint / SSID heuristic | 5–20 (weak) |
+
+Multiple signals stack (sum, capped at 100). `DETECT_FLOOR` (30) is the threshold below which the system stays `Unknown` — so a single weak signal won't false-positive.
+
+### 3. Register it
+
+```python
+PROVIDERS: list[Provider] = [
+    PanasonicProvider(),
+    FlynetProvider(),
+    MyAirlineProvider(),     # add yours here
+]
+```
+
+That's it. `detect_system()` will run your `detect()` alongside the others; `DataCollector` will dispatch fetches through your provider; `--probe` and `--probe-deep` will pick up your `discovery_domains` automatically.
+
+### 4. Optional hooks
+
+- **`post_detect(self, info, sig)`** — enrich `SystemInfo` after detection (e.g. discover a portal URL via DNS-domain wildcards, fetch a WISP URL once).
+- **`fetch_device_state(self, api_base)`** — return a `DeviceState` if the system exposes one (Panasonic does; FlyNet doesn't).
+- **`fetch_wisp_products(self, api_base)`** — return a list of paid-tier products for the **plans** view.
+- **`airline_from_flight_number(self, fn)`** — map a flight-number prefix (`"LX"` → `"SWISS"`) when the airline isn't known from network signals alone.
+
+### 5. Send a PR
+
+Include:
+
+- The new `Provider` subclass with brief comments on which signals you're matching.
+- Redacted output from `--probe-deep` showing the evidence your `detect()` relies on.
+- A live `--report` from an actual flight to confirm the fetchers work end-to-end.
 
 ## Disclaimer
 
