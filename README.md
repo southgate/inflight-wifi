@@ -20,7 +20,7 @@ Inflight WiFi is frequently flaky in ways that are hard to diagnose. Is the sate
 
 | System                | Airlines                              | Status                              |
 | ---                   | ---                                   | ---                                 |
-| Panasonic Avionics    | TAP, SWISS, KLM, Air France           | Verified on TAP and SWISS; full API mapped |
+| Panasonic Avionics    | TAP, SWISS, KLM, Air France, Thai Airways | Verified on TAP, SWISS, and Thai Airways; flight + connectivity + WISP plan catalog mapped |
 | Lufthansa FlyNet (BoardConnect) | LH, LX, OS, EW, WK          | Verified live on Lufthansa; `/fapi/flightData` mapped end-to-end |
 
 Everything else lands as `Unknown` — `--probe-deep` is built to help map new systems quickly.
@@ -79,7 +79,7 @@ python3 inflightd.py --probe-deep      # JS mining + HTML scrape + TLS SAN + por
 In rough order of confidence:
 
 1. **Gateway MAC OUI** — `00:0d:2e` is registered to Matsushita Avionics (Panasonic).
-2. **DNS search domain** — `onboardwifi` (TAP), `swissconnectforguests` (SWISS), `flynet`/`telekom`/`lufthansa` (FlyNet).
+2. **DNS search domain** — `onboardwifi` (TAP), `swissconnectforguests` (SWISS), `thaiskyconnect` (Thai Airways), `flynet`/`telekom`/`lufthansa` (FlyNet).
 3. **Server header on the gateway** — `PAC Web Server` is a dead giveaway.
 4. **TLS certificate SAN on the gateway** — Panasonic gateways present a cert for `api.airpana.com`.
 5. **Captive-portal redirect** — Apple's captive probe 302s to `captive.boardconnect.aero` on Lufthansa Group FlyNet (BoardConnect). This needs no SSID or Location permission, so it works even when macOS withholds the network name.
@@ -94,7 +94,7 @@ Single file, single process, no external dependencies.
 - **`NetworkSignals.gather()`** — one-shot capture of WiFi info, ARP table, DNS search domain, gateway MAC, captive-portal redirect. Providers read these; they don't re-fetch.
 - **`Provider`** — base class. Each inflight system is a subclass implementing `detect()` (returns a `Match` with a confidence score), `discover_api_base()`, and `fetch_flight()` / `fetch_connectivity()` / `fetch_device_state()` / `fetch_wisp_products()`. Defaults return `None`/`[]`, so providers only override what they expose.
 - **`PROVIDERS`** — registry list. `detect_system()` runs each provider against the gathered signals, picks the highest-confidence `Match` above `DETECT_FLOOR` (30), and stamps the result onto `SystemInfo`.
-- **`PanasonicProvider`** — TAP, KLM, Air France, SWISS. Constants (`oui_prefixes`, `api_base`) live as class attributes. API: `api.airpana.com/inflight/services/...`.
+- **`PanasonicProvider`** — TAP, KLM, Air France, SWISS, Thai Airways. Constants (`oui_prefixes`, `api_base`) live as class attributes. Flight/connectivity API: `api.airpana.com/inflight/services/...`. The **WISP plan catalog** comes from a separate host — the PacWISP portal (e.g. `inflight.pacwisp.net/<Airline>/`, discovered at detection): its `/backend/products` endpoint speaks `application/vnd.wisp.v2+json` and needs a per-airline carrier token scraped from the portal's bootstrap config. Verified live on Thai Airways.
 - **`FlynetProvider`** — Lufthansa Group FlyNet, running Lufthansa Systems **BoardConnect**. Detects via the captive-portal redirect to `captive.boardconnect.aero` (no SSID needed), then reads flight, position, and connectivity from one onboard endpoint: `GET /fapi/flightData` on `www.lufthansa-flynet.com` (DNS-hijacked to a private aircraft IP). Verified live on Lufthansa (FlyNet frontend v0.35.4).
 - **`DataCollector`** — ring buffer of `Snapshot`s, satellite coverage event tracker. Dispatches through `self.provider.fetch_*()` — no per-provider branching.
 - **`render_map()`** — ASCII world map with simplified coastline polylines and `great_circle_point()` interpolation.

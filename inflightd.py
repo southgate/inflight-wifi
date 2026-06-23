@@ -98,6 +98,46 @@ def http_get_json(url: str, timeout: float = 5.0) -> tuple[Optional[dict], float
     return None, elapsed
 
 
+def http_get_json_headers(url: str, headers: dict, timeout: float = 5.0) -> tuple[Optional[dict], float]:
+    """http_get_json variant that sends extra request headers — for APIs that
+    require a specific Accept/version or an auth token (e.g. the PacWISP portal
+    needs `Accept: application/vnd.wisp.v2+json` and an `X-Carrier` token)."""
+    start = time.monotonic()
+    h = {"User-Agent": "inflightd/1.0"}
+    h.update(headers)
+    try:
+        req = urllib.request.Request(url, headers=h)
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as resp:
+            if resp.status == 200:
+                body = resp.read().decode("utf-8", errors="replace")
+                return json.loads(body), (time.monotonic() - start) * 1000
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, OSError):
+        pass
+    return None, (time.monotonic() - start) * 1000
+
+
+def resolves_loopback_or_linklocal(host: str) -> bool:
+    """True if host resolves to a loopback or link-local address — the SSRF
+    targets a fetch must refuse (localhost services; 169.254.169.254 cloud
+    metadata). Deliberately NARROWER than resolves_private(): plain RFC1918
+    space is allowed, because onboard IFE portals legitimately resolve there
+    (e.g. inflight.pacwisp.net -> 10.x on the aircraft)."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_link_local:
+            return True
+    return False
+
+
 def resolves_private(host: str) -> bool:
     """True if host resolves to a private/loopback/link-local address.
 
@@ -377,7 +417,11 @@ class WISPProduct:
     id: int = 0
     name: str = ""
     description: str = ""
-    price_eur: float = 0.0
+    # Price in the catalog's own currency. Carriers price in different
+    # currencies (Thai Airways: USD; European Panasonic: EUR), so the amount
+    # carries its ISO 4217 code rather than assuming one. price == 0 means free.
+    price: float = 0.0
+    currency: str = ""  # ISO 4217 code, e.g. "USD"; "" when free/unknown
 
 
 @dataclass
@@ -406,6 +450,12 @@ class Snapshot:
     portal_latency_ms: float = 0.0
     proxy_latency_ms: float = 0.0
     external_latency_ms: float = 0.0
+    # True only on a clean 204 from the open-internet probe — proof of genuine
+    # unrestricted access. A walled-garden / captive device returns a portal
+    # redirect or 200 instead, so this distinguishes real internet from "got
+    # *a* response". Used to sanity-check the (sometimes misconfigured) device
+    # session state reported by the IFEC API.
+    external_internet_ok: bool = False
     throughput: dict = field(default_factory=dict)
     client_count: int = 0
     issues: list = field(default_factory=list)
@@ -581,6 +631,13 @@ class PanasonicProvider(Provider):
     api_base = "https://api.airpana.com/inflight/services"
     oui_prefixes = ["00:0d:2e"]  # Matsushita / Panasonic Avionics
 
+    def __init__(self):
+        # Stashed at detection so fetch_wisp_products() can reach the PacWISP
+        # portal (which lives off the inflight API, at its own host) and reuse a
+        # once-scraped carrier token rather than re-fetching the portal each call.
+        self._wisp_portal = ""
+        self._portal_cfg = None  # (carrier_token, currency, language)
+
     def detect(self, sig: NetworkSignals) -> Optional[Match]:
         confidence = 0
         airline = ""
@@ -594,6 +651,9 @@ class PanasonicProvider(Provider):
         if "swissconnect" in dns:
             confidence += 30
             airline = "SWISS"
+        if "thaiskyconnect" in dns:
+            confidence += 30
+            airline = "Thai Airways"
         for c in sig.arp_clients:
             host = c.get("hostname", "").lower()
             if "airpana" in host or "panasonic" in host:
@@ -628,16 +688,26 @@ class PanasonicProvider(Provider):
         return self.api_base
 
     def post_detect(self, info: SystemInfo, sig: NetworkSignals) -> None:
-        # Try DNS-search-domain wildcards for a portal URL if not already found
+        # Try DNS-search-domain wildcards for a portal URL if not already found.
+        # http first: the captive portal is served over http (the device isn't
+        # authenticated, so https throws cert errors) — on Thai Airways
+        # http://www.thaiskyconnect.aero serves the portal (200) while https
+        # answers 403. Accept only a real portal response (200 or a redirect to
+        # one), not any non-404 code: 403/5xx means "host is up but this isn't
+        # the portal", which is how the old https-only probe mislabeled it.
         if not info.portal_url and info.dns_domain:
             for sub in ("portal", "www", "wifi", "captive", "onboard"):
-                code, _, _ = http_get(f"https://{sub}.{info.dns_domain}/", timeout=3)
-                if code and code not in (0, 404):
-                    info.portal_url = f"https://{sub}.{info.dns_domain}"
+                for scheme in ("http", "https"):
+                    code, _, _ = http_get(f"{scheme}://{sub}.{info.dns_domain}/", timeout=3)
+                    if code == 200 or 300 <= code < 400:
+                        info.portal_url = f"{scheme}://{sub}.{info.dns_domain}"
+                        break
+                if info.portal_url:
                     break
         wisp, _ = http_get_json(f"{self.api_base}/exconnect/v1/wisp?lang=en")
         if wisp and "url" in wisp:
             info.pac_wisp_url = wisp["url"]
+            self._wisp_portal = wisp["url"]
 
     def fetch_flight(self, api_base: str) -> Optional[FlightData]:
         data, _ = http_get_json(f"{api_base}/flightdata/v2/flightdata")
@@ -667,15 +737,78 @@ class PanasonicProvider(Provider):
         fd.time_to_dest_min = data.get("time_to_destination_minutes", 0) or 0
         fd.distance_to_dest_nm = data.get("distance_to_destination_nautical_miles", 0) or 0
         fd.distance_from_origin_nm = data.get("distance_from_departure_nautical_miles", 0) or 0
-        fd.distance_covered_pct = data.get("distance_covered_percentage", 0) or 0
-        fd.flight_phase = data.get("flight_phase", "")
         fd.takeoff_time_utc = data.get("takeoff_time_utc", "")
+        # Progress: trust the API's distance_covered_percentage, but fall back to
+        # a time-based estimate when the API value is bogus. Early in the flight
+        # the avionics serves an uninitialized default — observed live on Thai
+        # Airways minutes after takeoff: 50%, with distance_from_departure ==
+        # distance_to_destination and flight_phase "touchdown". See
+        # _progress_pct() for the detection.
+        fd.distance_covered_pct = self._progress_pct(data, fd)
+        fd.flight_phase = data.get("flight_phase", "")
         fd.estimated_arrival_utc = data.get("estimated_arrival_time_utc", "")
         fd.current_utc_date = data.get("current_utc_date", "")
         fd.flight_state = data.get("flight_state", "")
         fd.weight_on_wheels = data.get("weight_on_wheels", False)
         fd.all_doors_closed = data.get("all_doors_closed", False)
         return fd
+
+    def _progress_pct(self, data: dict, fd: FlightData) -> int:
+        """Flight completion %. Prefer the API's distance_covered_percentage;
+        fall back to a time estimate (elapsed since takeoff vs time remaining)
+        only when the API value fails the sanity checks in _api_pct_trustworthy.
+        Returns the API value (or 0) if no time estimate is available."""
+        api_pct = data.get("distance_covered_percentage")
+        api_pct = api_pct if isinstance(api_pct, (int, float)) and not isinstance(api_pct, bool) else None
+
+        elapsed = self._minutes_since_utc(fd.takeoff_time_utc)
+        time_pct = None
+        if elapsed is not None and fd.time_to_dest_min > 0:
+            time_pct = int(round(100 * elapsed / (elapsed + fd.time_to_dest_min)))
+
+        if api_pct is not None and self._api_pct_trustworthy(api_pct, fd, time_pct):
+            return int(round(api_pct))
+        if time_pct is not None:
+            return time_pct
+        return int(round(api_pct)) if api_pct is not None else 0
+
+    @staticmethod
+    def _api_pct_trustworthy(api_pct: float, fd: FlightData, time_pct: Optional[int]) -> bool:
+        """False when the API progress shows the known uninitialized-default
+        signature, so the caller falls back to the time-based estimate."""
+        if not (0 <= api_pct <= 100):
+            return False
+        # Degenerate "equal halves" default: distance-from-origin equals
+        # distance-to-destination and both are non-zero. In real flight these
+        # are equal only at the exact midpoint — where the time estimate agrees
+        # anyway — so treating this as bogus is safe.
+        if fd.distance_from_origin_nm and fd.distance_from_origin_nm == fd.distance_to_dest_nm:
+            return False
+        # Cross-check against the independent time estimate. A large gap means
+        # the distance pipeline hasn't converged (or is stale) — trust time.
+        if time_pct is not None and abs(api_pct - time_pct) > 20:
+            return False
+        return True
+
+    @staticmethod
+    def _minutes_since_utc(ts: str) -> Optional[int]:
+        """Whole minutes from an ISO-ish UTC timestamp (e.g. '2026-06-22T18:58Z'
+        or with seconds) to now. None if missing/unparseable or in the future
+        (clock skew / pre-takeoff), so callers can fall back to the API value."""
+        if not ts:
+            return None
+        s = re.sub(r"[+-]\d{2}:?\d{2}$", "", ts.strip().rstrip("Z"))  # drop offset/Z
+        dt = None
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+            try:
+                dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return None
+        mins = int((datetime.now(timezone.utc) - dt).total_seconds() // 60)
+        return mins if mins >= 0 else None
 
     def fetch_connectivity(self, api_base: str) -> Optional[ConnectivityStatus]:
         data, _ = http_get_json(f"{api_base}/exconnect/v1/status")
@@ -695,6 +828,147 @@ class PanasonicProvider(Provider):
         return DeviceState(status=data.get("status", "UNKNOWN"), enabled=data.get("enabled", False))
 
     def fetch_wisp_products(self, api_base: str) -> list[WISPProduct]:
+        # The real WISP catalog lives on the PacWISP portal (its own host, e.g.
+        # inflight.pacwisp.net/<Airline>/), discovered via exconnect/v1/wisp at
+        # detection. Verified live on Thai Airways. The legacy inflight-API
+        # endpoint below is kept as a fallback for deployments that expose it.
+        # Defensive wrapper: this runs inside the collect cycle ahead of the
+        # network measurements, so a server-controlled malformed catalog must
+        # never raise out of here and starve diagnostics (or re-crash the TUI
+        # every tick). Worst case is an empty plans view.
+        try:
+            if self._wisp_portal:
+                products = self._fetch_pacwisp_products(self._wisp_portal)
+                if products:
+                    return products
+            return self._fetch_legacy_products(api_base)
+        except Exception:
+            return []
+
+    def _fetch_pacwisp_products(self, portal_url: str) -> list[WISPProduct]:
+        """Catalog from the PacWISP portal SPA. Its /backend/products endpoint
+        speaks `application/vnd.wisp.v2+json` and rejects requests without a
+        per-airline carrier token (HTTP 400 INVALID_CARRIER); that token, plus
+        the portal's default currency, are bootstrapped into the SPA's inline
+        config, so we scrape them once. Verified live on Thai Airways
+        (PacWISP v2.14.x): products carry name/description and reference a
+        normalized price ID, with the amount + ISO currency in a sibling table."""
+        portal = portal_url.rstrip("/")
+        split = urllib.parse.urlsplit(portal)
+        # SSRF guard: the portal URL comes from the onboard API, so a hostile
+        # network could point it at an internal address. Require https and
+        # refuse loopback / link-local targets (localhost, 169.254.169.254
+        # metadata). We do NOT refuse plain private space — onboard the portal
+        # legitimately resolves to RFC1918 (e.g. inflight.pacwisp.net -> 10.x),
+        # so blocking that would break the catalog in flight.
+        if (split.scheme != "https" or not split.hostname
+                or resolves_loopback_or_linklocal(split.hostname)):
+            return []
+        token, currency, language = self._portal_config(portal)
+        if not token:
+            return []
+        headers = {
+            "Accept": "application/vnd.wisp.v2+json",
+            "X-Language": language,
+            "X-Currency": currency,
+            "X-Carrier": token,
+        }
+        data, _ = http_get_json_headers(f"{portal}/backend/products", headers, timeout=8)
+        if not isinstance(data, dict) or data.get("status") != "success":
+            return []
+        return self._parse_pacwisp_products(data.get("data") or {}, currency)
+
+    def _portal_config(self, portal: str) -> tuple[str, str, str]:
+        """Scrape (carrier_token, currency, language) from the portal's inline
+        bootstrap config (window.COMBINED_AIRLINE_CONFIG). Cached per process."""
+        if self._portal_cfg is not None:
+            return self._portal_cfg
+        token = currency = language = ""
+        code, body, _ = http_get(f"{portal}/", timeout=8)
+        if code == 200 and body:
+            # Token charset isn't guaranteed hex across carriers — allow the
+            # general url-safe set so a UUID/base64 token still matches.
+            m = re.search(r'"carrier"\s*:\s*"([A-Za-z0-9_-]{16,})"', body)
+            token = m.group(1) if m else ""
+            m = re.search(r'"currency"\s*:\s*"([A-Za-z]{3})"', body)
+            currency = m.group(1).upper() if m else ""
+            # Tolerate locale tags (en-US, zh-Hans) and case — take the leading
+            # two-letter language subtag.
+            m = re.search(r'"language"\s*:\s*"([A-Za-z]{2})', body)
+            language = m.group(1).lower() if m else ""
+        cfg = (token, currency or "USD", language or "en")
+        # Only memoize a successful scrape: a transient portal blip must not
+        # permanently disable the catalog for the rest of the process.
+        if token:
+            self._portal_cfg = cfg
+        return cfg
+
+    @staticmethod
+    def _parse_pacwisp_products(data: dict, prefer_currency: str = "") -> list[WISPProduct]:
+        """Parse the PacWISP v2 catalog. Prices are normalized: each product
+        references a price ID resolved against a sibling `prices` table, and
+        each price carries its own currency in `allCurrencies`. Hidden and
+        voucher-only entries are skipped — the portal doesn't list them as
+        buyable plans. Ordered by the portal's own `weight`. Hardened against a
+        hostile/garbled payload: every container and scalar is type-checked so a
+        bad field drops one product instead of raising."""
+        products = data.get("products")
+        if not isinstance(products, list):
+            return []
+        # ids must be hashable (int/str) to key the table — skip anything else.
+        price_by_id = {px["id"]: px for px in data.get("prices", [])
+                       if isinstance(px, dict) and isinstance(px.get("id"), (int, str))}
+        out = []
+        for item in products:
+            if not isinstance(item, dict):
+                continue
+            if item.get("hidden") or item.get("voucher_only"):
+                continue
+            p = WISPProduct()
+            p.id = item.get("id", 0) or 0
+            p.name = str(item.get("name") or "")
+            p.description = str(item.get("description") or "")
+            price_ids = item.get("prices")
+            if isinstance(price_ids, list):
+                px = next((price_by_id[i] for i in price_ids
+                           if isinstance(i, (int, str)) and i in price_by_id), None)
+                if px:
+                    p.price, p.currency = PanasonicProvider._price_amount(px, prefer_currency)
+            weight = item.get("weight", 0)
+            out.append((weight if isinstance(weight, (int, float)) and not isinstance(weight, bool) else 0, p))
+        out.sort(key=lambda wp: wp[0])
+        return [p for _, p in out]
+
+    @staticmethod
+    def _price_amount(px: dict, prefer: str = "") -> tuple[float, str]:
+        """(amount, ISO currency) from a PacWISP price. Prefer the allCurrencies
+        entry whose code matches the requested currency, else the first entry
+        (it carries the ISO code), else the bare top-level value. Tolerates a
+        present-but-null `value` and non-numeric amounts."""
+        currencies = [c for c in (px.get("allCurrencies") or []) if isinstance(c, dict)]
+        chosen = None
+        if prefer:
+            chosen = next((c for c in currencies
+                           if str(c.get("currencyCode") or "").upper() == prefer.upper()), None)
+        if chosen is None and currencies:
+            chosen = currencies[0]
+        if chosen is not None:
+            val = chosen.get("value")
+            if val is None:
+                val = px.get("value")
+            try:
+                return float(val if val is not None else 0), str(chosen.get("currencyCode") or "")
+            except (TypeError, ValueError):
+                pass
+        try:
+            return float(px.get("value") or 0), ""
+        except (TypeError, ValueError):
+            return 0.0, ""
+
+    def _fetch_legacy_products(self, api_base: str) -> list[WISPProduct]:
+        """Fallback for deployments that expose the product catalog on the
+        inflight API directly (localized name/description, EUR price). Returns
+        [] when absent — which is the case on the PacWISP-portal carriers."""
         data, _ = http_get_json(f"{api_base}/exconnect/v1/wisp_product_info?lang=en")
         if not data or "data" not in data:
             return []
@@ -708,7 +982,13 @@ class PanasonicProvider(Provider):
             p.description = desc.get("eng", "") if isinstance(desc, dict) else str(desc)
             price = item.get("price", {})
             eur = price.get("eur", {}) if isinstance(price, dict) else {}
-            p.price_eur = eur.get("amount", 0) if isinstance(eur, dict) else 0
+            amount = eur.get("amount", 0) if isinstance(eur, dict) else 0
+            try:
+                amount = float(amount) if amount else 0.0
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount:
+                p.price, p.currency = amount, "EUR"
             products.append(p)
         return products
 
@@ -1767,7 +2047,8 @@ class DataCollector:
                 _, _, snap.portal_latency_ms = http_get(self.sys_info.portal_url, timeout=5)
 
             _, _, snap.proxy_latency_ms = http_get("http://captive.apple.com", timeout=10)
-            _, _, snap.external_latency_ms = http_get("https://www.google.com/generate_204", timeout=10)
+            ext_code, _, snap.external_latency_ms = http_get("https://www.google.com/generate_204", timeout=10)
+            snap.external_internet_ok = (ext_code == 204)
 
             snap.throughput = measure_throughput("https://www.google.com")
 
@@ -2273,8 +2554,25 @@ class TUI:
             y = self._draw_kv(y, "Global Conn", glob_str, glob_attr)
 
             if snap.device:
-                dev_str = f"{snap.device.status}" + (" (active)" if snap.device.enabled else "")
-                dev_attr = self._color(2) if snap.device.enabled else self._color(3)
+                # eXConnect device_state is the per-device session state, but it
+                # is not trustworthy everywhere: on Thai Airways it reports
+                # PENDING / enabled=false even with a paid plan active and the
+                # open internet plainly reachable. So only assert the positive
+                # (enabled). Otherwise report "undetermined" rather than a wrong
+                # "no plan" — and if a clean 204 proves internet is reachable,
+                # say so, surfacing the misconfiguration instead of routing
+                # around it.
+                if snap.device.enabled:
+                    dev_str, dev_attr = "active plan", self._color(2)
+                elif snap.external_internet_ok:
+                    # The google /generate_204 probe is the trustworthy signal:
+                    # a clean 204 proves the device has real open internet. The
+                    # plan/session state from the API is misconfigured on some
+                    # carriers (Thai Airways reports PENDING with a plan active),
+                    # so report connectivity as fact and leave the plan unknown.
+                    dev_str, dev_attr = "connected, plan unknown", self._color(2)
+                else:
+                    dev_str, dev_attr = "plan unknown (no internet reachable)", self._color(3)
                 y = self._draw_kv(y, "Device", dev_str, dev_attr)
 
             # Satellite coverage
@@ -2698,8 +2996,8 @@ class TUI:
         y = self._draw_section(y, "WIFI PLANS")
         y += 1
         for p in products:
-            price = f"EUR {p.price_eur:.2f}" if p.price_eur > 0 else "FREE"
-            price_attr = self._color(2, bold=True) if p.price_eur == 0 else curses.A_BOLD
+            price = f"{p.currency} {p.price:.2f}".strip() if p.price > 0 else "FREE"
+            price_attr = self._color(2, bold=True) if p.price == 0 else curses.A_BOLD
             self._addstr(y, 2, f"{p.name:<20}", curses.A_BOLD)
             self._addstr(y, 24, price, price_attr)
             y += 1
@@ -2929,6 +3227,7 @@ def run_report(json_mode: bool = False):
                 "dns_resolve_ms": snap.dns_resolve_ms,
                 "api_latency_ms": snap.api_latency_ms,
                 "external_latency_ms": snap.external_latency_ms,
+                "external_internet_ok": snap.external_internet_ok,
                 "proxy_latency_ms": snap.proxy_latency_ms,
                 "throughput": snap.throughput,
                 "client_count": snap.client_count,
