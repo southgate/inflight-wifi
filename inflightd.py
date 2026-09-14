@@ -349,13 +349,72 @@ class FlightData:
     distance_to_dest_nm: int = 0
     distance_from_origin_nm: float = 0.0
     distance_covered_pct: int = 0
-    flight_phase: str = ""
+    flight_phase: str = ""            # derived from telemetry (see derive_flight_phase)
+    flight_phase_reported: str = ""   # raw value from the onboard API, kept for the log
     takeoff_time_utc: str = ""
     estimated_arrival_utc: str = ""
     current_utc_date: str = ""
     flight_state: str = ""
     weight_on_wheels: bool = False
     all_doors_closed: bool = False
+
+
+# Phase-of-flight thresholds used by derive_flight_phase().
+PHASE_GROUND_SPEED_KTS = 80      # no airliner is airborne below this ground speed
+PHASE_TAXI_SPEED_KTS = 5         # rolling vs parked
+PHASE_LOW_ALT_FT = 10000         # below this: climb / descent / approach, never cruise
+PHASE_APPROACH_NM = 40           # within this of destination and low: approach
+PHASE_APPROACH_MIN = 15
+PHASE_TREND_FT = 250             # altitude change between snapshots that counts as a trend
+
+
+def derive_flight_phase(fd: "FlightData", prev_altitude_ft: Optional[int] = None) -> str:
+    """Work out the phase of flight from telemetry rather than the API's own
+    phase field. On TAP's Panasonic fleet `flight_phase` has read "approach"
+    for entire flights (FL400, mid-Atlantic, 7 h to go) across every logged
+    session, so the reported value is decorative at best. Altitude, ground
+    speed and distance/time remaining are live and consistent, so use those;
+    `prev_altitude_ft` (from the previous snapshot) disambiguates climb vs
+    descent when both fit. Falls back to the reported value when there is no
+    telemetry to reason from."""
+    alt = fd.altitude_ft or 0
+    gs = fd.ground_speed_kts or 0
+    have_telemetry = bool(alt or gs or fd.distance_to_dest_nm or fd.time_to_dest_min)
+    if not have_telemetry:
+        return fd.flight_phase_reported or fd.flight_phase or ""
+
+    if fd.weight_on_wheels or gs < PHASE_GROUND_SPEED_KTS:
+        return "taxi" if gs >= PHASE_TAXI_SPEED_KTS else "on ground"
+
+    trend = 0
+    if prev_altitude_ft:
+        delta = alt - prev_altitude_ft
+        if abs(delta) >= PHASE_TREND_FT:
+            trend = 1 if delta > 0 else -1
+
+    near_dest = ((0 < fd.distance_to_dest_nm <= PHASE_APPROACH_NM)
+                 or (0 < fd.time_to_dest_min <= PHASE_APPROACH_MIN))
+    if near_dest:
+        return "approach" if alt < PHASE_LOW_ALT_FT else "descent"
+
+    if alt >= PHASE_LOW_ALT_FT:
+        if trend < 0:
+            return "descent"
+        if trend > 0:
+            return "climb"
+        return "cruise"
+
+    # Low and fast: climbing out or coming down. Prefer the observed trend;
+    # otherwise whichever end of the route we are closer to.
+    if trend > 0:
+        return "climb"
+    if trend < 0:
+        return "descent"
+    if fd.distance_from_origin_nm and fd.distance_to_dest_nm:
+        return "climb" if fd.distance_from_origin_nm < fd.distance_to_dest_nm else "descent"
+    if fd.distance_covered_pct:
+        return "climb" if fd.distance_covered_pct < 50 else "descent"
+    return "climb"
 
 
 @dataclass
@@ -668,7 +727,7 @@ class PanasonicProvider(Provider):
         fd.distance_to_dest_nm = data.get("distance_to_destination_nautical_miles", 0) or 0
         fd.distance_from_origin_nm = data.get("distance_from_departure_nautical_miles", 0) or 0
         fd.distance_covered_pct = data.get("distance_covered_percentage", 0) or 0
-        fd.flight_phase = data.get("flight_phase", "")
+        fd.flight_phase_reported = data.get("flight_phase", "") or ""
         fd.takeoff_time_utc = data.get("takeoff_time_utc", "")
         fd.estimated_arrival_utc = data.get("estimated_arrival_time_utc", "")
         fd.current_utc_date = data.get("current_utc_date", "")
@@ -942,7 +1001,7 @@ class FlynetProvider(Provider):
         elapsed = self._hhmm_to_min(data.get("elapsedFlightTime"))
         if elapsed > 0 and fd.time_to_dest_min > 0:
             fd.distance_covered_pct = int(round(100 * elapsed / (elapsed + fd.time_to_dest_min)))
-        fd.flight_phase = str(data.get("flightPhase") or "")
+        fd.flight_phase_reported = str(data.get("flightPhase") or "")
         fd.estimated_arrival_utc = str(data.get("eta") or dest.get("localTimeAtArrival") or "")
         fd.current_utc_date = str(data.get("utc") or "")
         fd.weight_on_wheels = bool(data.get("weightOnWheels"))
@@ -1724,6 +1783,10 @@ class DataCollector:
             # Fast API calls — dispatch through the matched provider
             if self.provider and api:
                 snap.flight = self.provider.fetch_flight(api)
+                if snap.flight:
+                    prev = self.latest
+                    prev_alt = prev.flight.altitude_ft if prev and prev.flight else None
+                    snap.flight.flight_phase = derive_flight_phase(snap.flight, prev_alt)
                 snap.connectivity = self.provider.fetch_connectivity(api)
                 snap.device = self.provider.fetch_device_state(api)
 
