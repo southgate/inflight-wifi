@@ -135,21 +135,56 @@ def run_cmd(cmd: str, timeout: float = 10) -> str:
 
 
 _active_iface_cache: Optional[str] = None
+_active_iface_cached_at: float = 0.0
+ACTIVE_IFACE_TTL_S = 30.0
 
 
 def get_active_interface() -> str:
-    """Find the interface used by the default route (cached)."""
-    global _active_iface_cache
-    if _active_iface_cache:
+    """Find the interface used by the default route.
+
+    Cached briefly (ACTIVE_IFACE_TTL_S) so UI redraws don't shell out, but not
+    forever: the daemon is often started before joining the plane's Wi-Fi, or
+    while a VPN tunnel (utunN) owns the default route, and a stale interface
+    makes the ARP client count read 0 for the whole flight."""
+    global _active_iface_cache, _active_iface_cached_at
+    now = time.monotonic()
+    if _active_iface_cache and now - _active_iface_cached_at < ACTIVE_IFACE_TTL_S:
         return _active_iface_cache
+    iface = ""
     raw = run_cmd("route -n get default")
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("interface:"):
-            _active_iface_cache = line.split(":", 1)[1].strip()
-            return _active_iface_cache
-    _active_iface_cache = "en0"
-    return _active_iface_cache
+            iface = line.split(":", 1)[1].strip()
+            break
+    # A tunnel owning the default route (VPN) isn't where the LAN peers live;
+    # fall back to the Wi-Fi interface so ARP counting still sees the cabin.
+    if not iface or iface.startswith(("utun", "ipsec", "ppp")):
+        iface = _wifi_interface() or iface or "en0"
+    _active_iface_cache = iface
+    _active_iface_cached_at = now
+    return iface
+
+
+_wifi_iface_cache: Optional[str] = None
+
+
+def _wifi_interface() -> str:
+    """Hardware port named Wi-Fi (usually en0). Stable, so cached for the process."""
+    global _wifi_iface_cache
+    if _wifi_iface_cache is not None:
+        return _wifi_iface_cache
+    raw = run_cmd("networksetup -listallhardwareports")
+    found = ""
+    grab = False
+    for line in raw.splitlines():
+        if line.startswith("Hardware Port:"):
+            grab = "Wi-Fi" in line or "AirPort" in line
+        elif grab and line.startswith("Device:"):
+            found = line.split(":", 1)[1].strip()
+            break
+    _wifi_iface_cache = found
+    return found
 
 
 def get_wifi_info() -> dict:
@@ -167,23 +202,35 @@ def get_wifi_info() -> dict:
     return info
 
 
+ARP_PRIME_INTERVAL_S = 600   # re-probe well inside macOS's 1200s ARP max_age
+
+
 def populate_arp_cache(subnet_base: str, port: int = 80, timeout: float = 0.25,
-                       sample_size: int = 60) -> int:
-    """Trigger ARP resolution for hosts in a /24 subnet via brief TCP connect probes.
+                       sample_size: int = 60, subnet_mask: str = "") -> int:
+    """Trigger ARP resolution for hosts on the local subnet via brief TCP connect probes.
     macOS only caches ARP entries for hosts we've directly contacted; this prods the cache.
-    Returns number of probes fired."""
+    Covers the whole subnet when a mask is given (cabin networks are often /23 or
+    wider), else the /24 around subnet_base. Returns number of probes fired."""
     if not subnet_base or subnet_base.count(".") < 2:
         return 0
-    parts = subnet_base.split(".")
-    if len(parts) < 3:
-        return 0
-    prefix = ".".join(parts[:3])
-    # Sample a spread of host octets, including likely device ranges
-    octets = list(range(1, 256))
-    if sample_size < len(octets):
+    hosts: list[str] = []
+    try:
+        net = ipaddress.ip_network(f"{subnet_base}/{subnet_mask or '255.255.255.0'}", strict=False)
+        if net.prefixlen < 22:   # cap the sweep at 1022 hosts
+            net = ipaddress.ip_network(f"{subnet_base}/22", strict=False)
+        hosts = [str(h) for h in net.hosts()]
+    except ValueError:
+        parts = subnet_base.split(".")
+        if len(parts) < 3:
+            return 0
+        prefix = ".".join(parts[:3])
+        hosts = [f"{prefix}.{o}" for o in range(1, 256)]
+    # Scale the sample with the subnet so a /23 isn't probed more thinly than a /24
+    sample_size = max(sample_size, sample_size * len(hosts) // 254)
+    if sample_size < len(hosts):
         # Even spread
-        step = max(1, len(octets) // sample_size)
-        octets = octets[::step][:sample_size]
+        step = max(1, len(hosts) // sample_size)
+        hosts = hosts[::step][:sample_size]
 
     def probe(ip):
         try:
@@ -195,13 +242,13 @@ def populate_arp_cache(subnet_base: str, port: int = 80, timeout: float = 0.25,
             pass
 
     threads = []
-    for o in octets:
-        t = threading.Thread(target=probe, args=(f"{prefix}.{o}",), daemon=True)
+    for ip in hosts:
+        t = threading.Thread(target=probe, args=(ip,), daemon=True)
         t.start()
         threads.append(t)
     for t in threads:
         t.join(timeout=timeout + 0.1)
-    return len(octets)
+    return len(hosts)
 
 
 def get_gateway_mac() -> Optional[str]:
@@ -244,8 +291,24 @@ def get_arp_clients() -> list[dict]:
         mac = m.group(3)
         if mac == "(incomplete)":
             continue
+        if not _is_host_arp_entry(m.group(2), mac):
+            continue
         clients.append({"hostname": m.group(1), "ip": m.group(2), "mac": mac})
     return clients
+
+
+def _is_host_arp_entry(ip: str, mac: str) -> bool:
+    """False for broadcast, multicast and link-local rows that `arp -an` lists
+    alongside real peers (255.255.255.255, 224.0.0.251, 169.254.x.x, ...)."""
+    mac_l = mac.lower()
+    if mac_l.startswith("ff:ff:ff") or mac_l.startswith("1:0:5e") or mac_l.startswith("01:00:5e"):
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (addr.is_multicast or addr.is_link_local or addr.is_unspecified
+                or ip == "255.255.255.255")
 
 
 def check_gateway_https(gateway_ip: str, timeout: float = 4.0) -> bool:
@@ -1763,13 +1826,31 @@ class DataCollector:
         self._last_conn_state: Optional[bool] = None
         self._last_conn_time: float = 0.0
         self._products_fetched = False
-        self._arp_populated = False
+        self._arp_primed_at: float = 0.0
         self.collecting = False
         self.last_error: str = ""
 
     @property
     def latest(self) -> Optional[Snapshot]:
         return self.history[-1] if self.history else None
+
+    def _refresh_network_identity(self) -> None:
+        """Pick up a changed router / local IP / subnet (new Wi-Fi joined after
+        startup, DHCP re-lease). A gateway change forces an ARP re-prime."""
+        wifi = get_wifi_info()
+        gw = wifi.get("router", "")
+        if gw and gw != self.sys_info.gateway_ip:
+            self.sys_info.gateway_ip = gw
+            self.sys_info.gateway_mac = get_gateway_mac() or ""
+            self._arp_primed_at = 0.0
+        ip = wifi.get("ip_address", "")
+        if ip and ip != self.sys_info.local_ip:
+            self.sys_info.local_ip = ip
+        mask = wifi.get("subnet_mask", "")
+        if mask and mask != self.sys_info.subnet:
+            self.sys_info.subnet = mask
+        if wifi.get("ssid") and not self.sys_info.ssid:
+            self.sys_info.ssid = wifi["ssid"]
 
     def collect(self) -> Snapshot:
         """Run one full collection cycle."""
@@ -1807,11 +1888,18 @@ class DataCollector:
                 self._products_fetched = True
 
             # Network measurements
-            # Populate ARP cache once via TCP probes — ARP only caches hosts we've
+            # Re-read the gateway/subnet each cycle: the daemon is often started
+            # before boarding Wi-Fi is joined, and the startup values go stale.
+            self._refresh_network_identity()
+
+            # Prime the ARP cache via TCP probes — ARP only caches hosts we've
             # contacted, so on captive networks `arp -a` is empty without this.
-            if self.sys_info.gateway_ip and not self._arp_populated:
-                populate_arp_cache(self.sys_info.gateway_ip)
-                self._arp_populated = True
+            # Entries age out after ~20 min, so re-prime periodically.
+            if (self.sys_info.gateway_ip
+                    and time.monotonic() - self._arp_primed_at > ARP_PRIME_INTERVAL_S):
+                populate_arp_cache(self.sys_info.local_ip or self.sys_info.gateway_ip,
+                                   subnet_mask=self.sys_info.subnet)
+                self._arp_primed_at = time.monotonic()
 
             clients = get_arp_clients()
             snap.client_count = len(clients)
